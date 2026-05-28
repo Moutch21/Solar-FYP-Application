@@ -52,11 +52,7 @@ solar-fyp-app/
 ├── app.py                      # Main Streamlit application
 ├── requirements.txt            # Python dependencies
 ├── README.md                   # Project documentation
-│
-└── data/                       # (optional) Sample datasets
-    ├── fusionsolar_hourly.csv  # Hourly resampled inverter data
-    ├── fusionsolar_5min.csv    # Raw 5-minute inverter data
-    └── fusionsolar_daily.csv   # Daily summary data
+
 ```
 
 ---
