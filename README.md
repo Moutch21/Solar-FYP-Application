@@ -16,7 +16,7 @@ The web application allows homeowners to:
 - Estimate monthly electricity savings under TNB NEM 3.0
 - Identify the best times to run high-consumption appliances
 
-**Live App:** [Click here to open](https://solar-fyp-application.streamlit.app)
+**Live App:** [Click here to open](https://solarpredictionfyp.streamlit.app/)
 
 ---
 
