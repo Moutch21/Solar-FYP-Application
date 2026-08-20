@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from sklearn.ensemble import RandomForestRegressor
@@ -13,6 +14,11 @@ warnings.filterwarnings('ignore')
 
 # PAGE CONFIG
 st.set_page_config(page_title="Solar Power Prediction", page_icon="☀️", layout="wide")
+
+# INSTALLATION COORDINATES
+# Used to fetch the 7 day weather forecast from Open Meteo for this specific home
+HOME_LATITUDE  = 2.973306
+HOME_LONGITUDE = 101.771435
 
 # TNB NEM 3.0 CONSTANTS
 TNB_ENERGY_CHARGE   = 0.2703
@@ -167,6 +173,90 @@ def calculate_savings(df, monthly_kwh):
         })
     return pd.DataFrame(rows)
 
+# 7 DAY WEATHER FORECAST (OPEN METEO)
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_weather_forecast(lat, lon, days=7):
+    """
+    Fetch hourly shortwave radiation, cloud cover, and temperature
+    for the next `days` days from Open Meteo. No API key required.
+    Cached for 1 hour so repeated tab switches do not refetch.
+    """
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude":  lat,
+        "longitude": lon,
+        "hourly":    "shortwave_radiation,cloudcover,temperature_2m",
+        "forecast_days": days,
+        "timezone":  "Asia/Kuala_Lumpur",
+    }
+    resp = requests.get(url, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()["hourly"]
+    fc = pd.DataFrame({
+        "timestamp":       pd.to_datetime(data["time"]),
+        "irradiance_wm2":  data["shortwave_radiation"],
+        "cloud_amt_pct":   data["cloudcover"],
+        "temperature_c":   data["temperature_2m"],
+    })
+    return fc
+
+def build_forecast_features(fc_df, recent_actual_df):
+    """
+    Turn the raw Open Meteo forecast into the same feature set the
+    trained model expects, including weather classification and a
+    recursively updated 24h lag feature (since future lag values do
+    not exist yet, each day's forecast uses the previous day's
+    predicted output once available, falling back to the last known
+    real value for day 1).
+    """
+    fc = fc_df.copy()
+    fc["hour"]        = fc["timestamp"].dt.hour
+    fc["day_of_week"] = fc["timestamp"].dt.dayofweek
+    fc["month"]       = fc["timestamp"].dt.month
+    fc["is_weekend"]  = (fc["day_of_week"] >= 5).astype(int)
+    fc["time_window"] = fc["hour"].apply(label_window)
+    fc["hour_sin"]    = np.sin(2 * np.pi * fc["hour"]  / 24)
+    fc["hour_cos"]    = np.cos(2 * np.pi * fc["hour"]  / 24)
+    fc["month_sin"]   = np.sin(2 * np.pi * fc["month"] / 12)
+    fc["month_cos"]   = np.cos(2 * np.pi * fc["month"] / 12)
+
+    fc["weather_condition"] = fc.apply(
+        lambda r: classify_weather(r["irradiance_wm2"], r["cloud_amt_pct"], r["hour"]),
+        axis=1
+    )
+    weather_map = {'Sunny': 2, 'Cloudy': 1, 'Rainy': 0, 'Night': -1, 'Unknown': -1}
+    fc["weather_code"] = fc["weather_condition"].map(weather_map)
+
+    # Seed the lag feature using the last 24h of real recorded data.
+    last_actual = (recent_actual_df.sort_values("timestamp")
+                   .tail(24)['power_output_kw'].mean())
+    fc["lag_24h_avg"] = last_actual  # starting reference for day 1
+
+    return fc
+
+def predict_forecast(clf, fc_features, feat_names):
+    """
+    Recursive multi day forecasting. Predicts hour by hour, and once
+    a full day of predictions exists, uses that day's average as the
+    lag_24h_avg input for the next day, rather than leaving it fixed.
+    """
+    fc = fc_features.copy().reset_index(drop=True)
+    fc["predicted_kw"] = 0.0
+    fc["date"] = fc["timestamp"].dt.date
+
+    unique_dates = sorted(fc["date"].unique())
+    running_lag = fc["lag_24h_avg"].iloc[0]
+
+    for d in unique_dates:
+        mask = fc["date"] == d
+        fc.loc[mask, "lag_24h_avg"] = running_lag
+        X_day = fc.loc[mask, feat_names]
+        preds = np.clip(clf.predict(X_day), 0, None)
+        fc.loc[mask, "predicted_kw"] = preds
+        running_lag = preds.mean()  # feed into next day's lag
+
+    return fc
+
 # SIDEBAR
 with st.sidebar:
     st.title("Solar FYP")
@@ -242,8 +332,8 @@ if using_sample:
     st.info("Showing sample data (180 days) with simulated weather conditions. Upload your merged FusionSolar + NASA POWER export in the sidebar to use real data.")
 st.divider()
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "Data Overview", "Time-of-Day Analysis", "Prediction Model", "Cost & Savings"
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Data Overview", "Time-of-Day Analysis", "Prediction Model", "Cost & Savings", "7 Day Forecast"
 ])
 
 # TAB 1 - DATA OVERVIEW
@@ -488,3 +578,74 @@ with tab4:
         f"TNB NEM 3.0 total rate: {TNB_TOTAL_RATE*100:.2f} sen/kWh for usage up to 1,500 kWh/month. "
         f"Monthly consumption set to {monthly_kwh} kWh. Adjust the slider in the sidebar to match your TNB bill."
     )
+
+# TAB 5 - 7 DAY FORECAST
+with tab5:
+    st.subheader("7 Day Solar Generation Forecast")
+    st.caption(
+        f"Forecast for installation at latitude {HOME_LATITUDE}, longitude {HOME_LONGITUDE}, "
+        f"using live weather forecast data from Open-Meteo (no historical replay, this is a real forecast)."
+    )
+
+    if st.button("Fetch Latest 7 Day Forecast", type="primary"):
+        st.session_state["run_forecast"] = True
+
+    if st.session_state.get("run_forecast", False):
+        try:
+            with st.spinner("Fetching weather forecast and running predictions..."):
+                fc_raw = fetch_weather_forecast(HOME_LATITUDE, HOME_LONGITUDE, days=7)
+                fc_features = build_forecast_features(fc_raw, df)
+                fc_result = predict_forecast(clf, fc_features, feat_names)
+
+            st.success(f"Forecast generated for {fc_result['date'].nunique()} days ahead.")
+
+            daily_forecast = (fc_result.groupby('date')['predicted_kw']
+                               .sum().reset_index())
+            daily_forecast.columns = ['Date', 'Predicted kWh']
+            daily_forecast['Predicted kWh'] = daily_forecast['Predicted kWh'].round(2)
+
+            st.subheader("Daily Predicted Generation")
+            fig6, ax6 = plt.subplots(figsize=(12, 3.5))
+            ax6.bar(daily_forecast['Date'].astype(str), daily_forecast['Predicted kWh'],
+                    color='#F59E0B', alpha=0.85)
+            ax6.set_ylabel('Predicted kWh')
+            ax6.grid(axis='y', alpha=0.25, linestyle='--')
+            ax6.spines[['top','right']].set_visible(False)
+            plt.xticks(rotation=30, ha='right')
+            plt.tight_layout()
+            st.pyplot(fig6); plt.close()
+
+            st.subheader("Hourly Forecast Detail")
+            hourly_cols = ['timestamp','hour','weather_condition','irradiance_wm2',
+                            'cloud_amt_pct','temperature_c','predicted_kw']
+            st.dataframe(fc_result[hourly_cols].round(2), use_container_width=True, height=300)
+
+            st.subheader("Forecasted Weather Condition Mix")
+            daytime_fc = fc_result[fc_result['weather_condition'].isin(['Sunny','Cloudy','Rainy'])]
+            if len(daytime_fc) > 0:
+                wc_counts = daytime_fc['weather_condition'].value_counts()
+                fw1, fw2, fw3 = st.columns(3)
+                fw1.metric("Sunny Hours (7d)",  int(wc_counts.get('Sunny', 0)))
+                fw2.metric("Cloudy Hours (7d)", int(wc_counts.get('Cloudy', 0)))
+                fw3.metric("Rainy Hours (7d)",  int(wc_counts.get('Rainy', 0)))
+
+            st.subheader("Estimated Savings for the Week Ahead")
+            week_total_kwh = daily_forecast['Predicted kWh'].sum()
+            week_saving = min(week_total_kwh, monthly_kwh / 30 * 7) * TNB_TOTAL_RATE
+            fs1, fs2 = st.columns(2)
+            fs1.metric("Total Predicted Generation (7d)", f"{week_total_kwh:,.1f} kWh")
+            fs2.metric("Estimated Savings (7d)", f"RM {week_saving:,.2f}")
+
+            st.caption(
+                "This forecast uses live Open-Meteo weather data, not historical NASA POWER data. "
+                "Day 1 uses your most recent actual generation as the reference lag value. "
+                "Days 2 to 7 use the model's own prior day prediction as the lag input "
+                "(recursive forecasting), so accuracy naturally decreases the further ahead the forecast goes."
+            )
+
+        except requests.exceptions.RequestException as e:
+            st.error(f"Could not reach the weather forecast service: {e}")
+        except Exception as e:
+            st.error(f"Forecast generation failed: {e}")
+    else:
+        st.info("Click the button above to fetch the latest 7 day weather forecast and generate predictions.")
