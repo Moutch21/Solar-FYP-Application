@@ -7,6 +7,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from xgboost import XGBRegressor
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -123,8 +124,20 @@ def train_model(df, model_type):
     clean = df.dropna(subset=features + ['power_output_kw'])
     X, y  = clean[features], clean['power_output_kw']
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-    clf = (RandomForestRegressor(n_estimators=150, random_state=42, n_jobs=-1)
-           if model_type == 'Random Forest' else LinearRegression())
+    if model_type == 'Random Forest':
+        clf = RandomForestRegressor(n_estimators=150, random_state=42, n_jobs=-1)
+    elif model_type == 'XGBoost':
+        clf = XGBRegressor(
+            n_estimators=200,
+            learning_rate=0.05,
+            max_depth=5,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            n_jobs=-1,
+        )
+    else:
+        clf = LinearRegression()
     clf.fit(X_train, y_train)
     y_pred = np.clip(clf.predict(X_test), 0, None)
     metrics = {
@@ -166,8 +179,8 @@ with st.sidebar:
         uploaded = st.file_uploader("Upload file", type=['csv','xlsx'])
     st.divider()
     st.subheader("Model")
-    model_type = st.selectbox("Algorithm", ["Random Forest", "Linear Regression"])
-    st.caption("XGBoost option will be added next.")
+    model_type = st.selectbox("Algorithm", ["Random Forest", "XGBoost", "Linear Regression"])
+    st.caption("Random Forest: primary model. XGBoost: gradient boosting, higher accuracy but needs more tuning. Linear Regression: baseline.")
     st.divider()
     st.subheader("Your Household")
     monthly_kwh = st.slider("Monthly consumption (kWh)", 300, 1500, 600, 50)
@@ -406,12 +419,13 @@ with tab3:
     else:
         st.caption("Weather condition feature not available in this dataset.")
 
-    if model_type == 'Random Forest':
+    if model_type in ('Random Forest', 'XGBoost'):
         st.subheader("Feature Importance")
         imp_df = (pd.DataFrame({'Feature': feat_names, 'Importance': clf.feature_importances_})
                   .sort_values('Importance', ascending=True))
+        bar_color = '#3B82F6' if model_type == 'Random Forest' else '#10B981'
         fig4, ax4 = plt.subplots(figsize=(7, max(3, len(feat_names) * 0.5)))
-        ax4.barh(imp_df['Feature'], imp_df['Importance'], color='#3B82F6', alpha=0.85)
+        ax4.barh(imp_df['Feature'], imp_df['Importance'], color=bar_color, alpha=0.85)
         ax4.set_xlabel('Importance')
         ax4.grid(axis='x', alpha=0.25, linestyle='--')
         ax4.spines[['top','right']].set_visible(False)
