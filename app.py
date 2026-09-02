@@ -1,272 +1,60 @@
+"""
+app.py
+
+Streamlit UI only. All data processing, weather logic, model training,
+and cost calculation live in their own modules and are imported here.
+If you need to fix a specific part of the project:
+
+  locations.py        -> state/city coordinate lookup
+  weather.py            -> weather classification, NASA POWER, Open Meteo
+  data_pipeline.py      -> sample data, feature engineering, forecast features
+  models.py             -> Random Forest / XGBoost / Linear Regression training
+  cost_calculator.py    -> TNB NEM 3.0 savings calculation
+
+This file should only ever contain layout, widgets, and calls into
+the functions above, nothing else.
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error, r2_score
 import warnings
 warnings.filterwarnings('ignore')
 
+from locations import MALAYSIA_LOCATIONS
+from weather import WEATHER_COLORS, merge_with_nasa_power, fetch_weather_forecast, NASA_LATENCY_DAYS
+from data_pipeline import generate_sample_data, label_window, engineer_features, build_forecast_features
+from models import train_model, predict_forecast
+from cost_calculator import (
+    calculate_savings,
+    TNB_ENERGY_CHARGE, TNB_CAPACITY_CHARGE, TNB_NETWORK_CHARGE, TNB_TOTAL_RATE,
+)
+
 # PAGE CONFIG
-st.set_page_config(page_title="Solar Power Prediction", page_icon="☀️", layout="wide")
-
-# INSTALLATION COORDINATES
-# Used to fetch the 7 day weather forecast from Open Meteo for this specific home
-HOME_LATITUDE  = 2.973306
-HOME_LONGITUDE = 101.771435
-
-# TNB NEM 3.0 CONSTANTS
-TNB_ENERGY_CHARGE   = 0.2703
-TNB_CAPACITY_CHARGE = 0.0455
-TNB_NETWORK_CHARGE  = 0.1285
-TNB_TOTAL_RATE      = 0.4443
-
-# WEATHER CLASSIFICATION THRESHOLDS
-# Based on NASA POWER ALLSKY_SFC_SW_DWN (irradiance, W/m2) and CLOUD_AMT (cloud amount, %)
-# Daytime hours only. Night hours are labeled Night separately.
-IRRADIANCE_SUNNY_MIN = 600.0   # W/m2, high irradiance
-IRRADIANCE_RAINY_MAX = 200.0   # W/m2, low irradiance
-CLOUD_SUNNY_MAX      = 30.0    # % cloud cover
-CLOUD_RAINY_MIN       = 70.0    # % cloud cover
-
-def classify_weather(irradiance, cloud_amt, hour):
-    """
-    Classify a single hourly reading into Sunny, Cloudy, or Rainy.
-    Night hours (irradiance effectively zero) are returned as Night
-    and excluded from weather condition breakdowns.
-    """
-    if hour < 6 or hour >= 19:
-        return 'Night'
-    if pd.isna(irradiance) or pd.isna(cloud_amt):
-        return 'Unknown'
-    if irradiance >= IRRADIANCE_SUNNY_MIN and cloud_amt <= CLOUD_SUNNY_MAX:
-        return 'Sunny'
-    if irradiance <= IRRADIANCE_RAINY_MAX or cloud_amt >= CLOUD_RAINY_MIN:
-        return 'Rainy'
-    return 'Cloudy'
-
-WEATHER_COLORS = {
-    'Sunny':  '#F59E0B',
-    'Cloudy': '#9CA3AF',
-    'Rainy':  '#3B82F6',
-    'Night':  '#1F2937',
-    'Unknown':'#D1D5DB',
-}
-
-# GENERATE SAMPLE DATA
-def generate_sample_data(days=180):
-    np.random.seed(42)
-    dates = pd.date_range(start='2024-01-01', periods=days * 24, freq='h')
-    rows = []
-    for dt in dates:
-        h = dt.hour
-        m = dt.month
-        if 6 <= h <= 18:
-            peak     = np.exp(-0.5 * ((h - 12) / 3.0) ** 2)
-            seasonal = 1.0 if m in [3,4,5,6,7] else 0.85
-            cloud_factor = np.random.beta(4, 2)  # 1.0 = clear, lower = more cloud
-            power    = round(max(0.0, peak * seasonal * cloud_factor * 4.5 + np.random.normal(0, 0.08)), 3)
-            irr      = round(max(0.0, power / 4.5 * 1000 * np.random.uniform(0.9, 1.1)), 1)
-            cloud_amt = round(max(0.0, min(100.0, (1 - cloud_factor) * 100 + np.random.normal(0, 8))), 1)
-        else:
-            power = 0.0
-            irr   = 0.0
-            cloud_amt = round(np.random.uniform(20, 80), 1)
-        temp = 28 + 6 * np.sin((h - 6) * np.pi / 12) + np.random.normal(0, 1)
-        temp = round(max(22.0, min(38.0, temp)), 1)
-        rows.append({'timestamp': dt, 'power_output_kw': power,
-                     'irradiance_wm2': irr, 'cloud_amt_pct': cloud_amt,
-                     'temperature_c': temp})
-    return pd.DataFrame(rows)
-
-def label_window(hour):
-    if 6 <= hour < 10:   return 'Morning (6am-10am)'
-    elif 10 <= hour < 14: return 'Midday Peak (10am-2pm)'
-    elif 14 <= hour < 18: return 'Afternoon (2pm-6pm)'
-    else:                 return 'Off-Peak (6pm-6am)'
-
-def engineer_features(df):
-    df = df.copy()
-    df['hour']        = df['timestamp'].dt.hour
-    df['day_of_week'] = df['timestamp'].dt.dayofweek
-    df['month']       = df['timestamp'].dt.month
-    df['is_weekend']  = (df['day_of_week'] >= 5).astype(int)
-    df['time_window'] = df['hour'].apply(label_window)
-    df['hour_sin']    = np.sin(2 * np.pi * df['hour']  / 24)
-    df['hour_cos']    = np.cos(2 * np.pi * df['hour']  / 24)
-    df['month_sin']   = np.sin(2 * np.pi * df['month'] / 12)
-    df['month_cos']   = np.cos(2 * np.pi * df['month'] / 12)
-    df['lag_24h_avg'] = (df['power_output_kw'].shift(24)
-                         .rolling(24, min_periods=1).mean().fillna(0))
-
-    # Weather condition classification
-    if 'irradiance_wm2' in df.columns and 'cloud_amt_pct' in df.columns:
-        df['weather_condition'] = df.apply(
-            lambda r: classify_weather(r['irradiance_wm2'], r['cloud_amt_pct'], r['hour']),
-            axis=1
-        )
-        # Numeric encoding for models that need a numeric weather feature
-        weather_map = {'Sunny': 2, 'Cloudy': 1, 'Rainy': 0, 'Night': -1, 'Unknown': -1}
-        df['weather_code'] = df['weather_condition'].map(weather_map)
-    else:
-        df['weather_condition'] = 'Unknown'
-        df['weather_code'] = -1
-
-    return df
-
-FEATURES = ['hour_sin','hour_cos','month_sin','month_cos',
-            'day_of_week','is_weekend','lag_24h_avg']
-
-def train_model(df, model_type):
-    features = FEATURES.copy()
-    if 'irradiance_wm2' in df.columns: features.append('irradiance_wm2')
-    if 'temperature_c'  in df.columns: features.append('temperature_c')
-    if 'weather_code'   in df.columns: features.append('weather_code')
-    clean = df.dropna(subset=features + ['power_output_kw'])
-    X, y  = clean[features], clean['power_output_kw']
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-    if model_type == 'Random Forest':
-        clf = RandomForestRegressor(n_estimators=150, random_state=42, n_jobs=-1)
-    elif model_type == 'XGBoost':
-        clf = XGBRegressor(
-            n_estimators=200,
-            learning_rate=0.05,
-            max_depth=5,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42,
-            n_jobs=-1,
-        )
-    else:
-        clf = LinearRegression()
-    clf.fit(X_train, y_train)
-    y_pred = np.clip(clf.predict(X_test), 0, None)
-    metrics = {
-        'MAE':  round(mean_absolute_error(y_test, y_pred), 4),
-        'RMSE': round(np.sqrt(mean_squared_error(y_test, y_pred)), 4),
-        'R2':   round(r2_score(y_test, y_pred), 4),
-    }
-    return clf, X_test, y_test.reset_index(drop=True), y_pred, metrics, features
-
-def calculate_savings(df, monthly_kwh):
-    daily_kwh = monthly_kwh / 30.0
-    rows = []
-    for date, grp in df.groupby(df['timestamp'].dt.date):
-        solar     = grp['power_output_kw'].sum()
-        grid_used = max(0.0, daily_kwh - solar)
-        offset    = min(solar, daily_kwh)
-        bill_no   = daily_kwh * TNB_TOTAL_RATE
-        bill_with = grid_used * TNB_TOTAL_RATE
-        rows.append({
-            'date':                  pd.Timestamp(date),
-            'solar_generated_kwh':   round(solar,     2),
-            'grid_consumed_kwh':     round(grid_used, 2),
-            'solar_offset_kwh':      round(offset,    2),
-            'bill_without_solar_rm': round(bill_no,   2),
-            'bill_with_solar_rm':    round(bill_with, 2),
-            'saving_rm':             round(bill_no - bill_with, 2),
-        })
-    return pd.DataFrame(rows)
-
-# 7 DAY WEATHER FORECAST (OPEN METEO)
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_weather_forecast(lat, lon, days=7):
-    """
-    Fetch hourly shortwave radiation, cloud cover, and temperature
-    for the next `days` days from Open Meteo. No API key required.
-    Cached for 1 hour so repeated tab switches do not refetch.
-    """
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude":  lat,
-        "longitude": lon,
-        "hourly":    "shortwave_radiation,cloudcover,temperature_2m",
-        "forecast_days": days,
-        "timezone":  "Asia/Kuala_Lumpur",
-    }
-    resp = requests.get(url, params=params, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()["hourly"]
-    fc = pd.DataFrame({
-        "timestamp":       pd.to_datetime(data["time"]),
-        "irradiance_wm2":  data["shortwave_radiation"],
-        "cloud_amt_pct":   data["cloudcover"],
-        "temperature_c":   data["temperature_2m"],
-    })
-    return fc
-
-def build_forecast_features(fc_df, recent_actual_df):
-    """
-    Turn the raw Open Meteo forecast into the same feature set the
-    trained model expects, including weather classification and a
-    recursively updated 24h lag feature (since future lag values do
-    not exist yet, each day's forecast uses the previous day's
-    predicted output once available, falling back to the last known
-    real value for day 1).
-    """
-    fc = fc_df.copy()
-    fc["hour"]        = fc["timestamp"].dt.hour
-    fc["day_of_week"] = fc["timestamp"].dt.dayofweek
-    fc["month"]       = fc["timestamp"].dt.month
-    fc["is_weekend"]  = (fc["day_of_week"] >= 5).astype(int)
-    fc["time_window"] = fc["hour"].apply(label_window)
-    fc["hour_sin"]    = np.sin(2 * np.pi * fc["hour"]  / 24)
-    fc["hour_cos"]    = np.cos(2 * np.pi * fc["hour"]  / 24)
-    fc["month_sin"]   = np.sin(2 * np.pi * fc["month"] / 12)
-    fc["month_cos"]   = np.cos(2 * np.pi * fc["month"] / 12)
-
-    fc["weather_condition"] = fc.apply(
-        lambda r: classify_weather(r["irradiance_wm2"], r["cloud_amt_pct"], r["hour"]),
-        axis=1
-    )
-    weather_map = {'Sunny': 2, 'Cloudy': 1, 'Rainy': 0, 'Night': -1, 'Unknown': -1}
-    fc["weather_code"] = fc["weather_condition"].map(weather_map)
-
-    # Seed the lag feature using the last 24h of real recorded data.
-    last_actual = (recent_actual_df.sort_values("timestamp")
-                   .tail(24)['power_output_kw'].mean())
-    fc["lag_24h_avg"] = last_actual  # starting reference for day 1
-
-    return fc
-
-def predict_forecast(clf, fc_features, feat_names):
-    """
-    Recursive multi day forecasting. Predicts hour by hour, and once
-    a full day of predictions exists, uses that day's average as the
-    lag_24h_avg input for the next day, rather than leaving it fixed.
-    """
-    fc = fc_features.copy().reset_index(drop=True)
-    fc["predicted_kw"] = 0.0
-    fc["date"] = fc["timestamp"].dt.date
-
-    unique_dates = sorted(fc["date"].unique())
-    running_lag = fc["lag_24h_avg"].iloc[0]
-
-    for d in unique_dates:
-        mask = fc["date"] == d
-        fc.loc[mask, "lag_24h_avg"] = running_lag
-        X_day = fc.loc[mask, feat_names]
-        preds = np.clip(clf.predict(X_day), 0, None)
-        fc.loc[mask, "predicted_kw"] = preds
-        running_lag = preds.mean()  # feed into next day's lag
-
-    return fc
+st.set_page_config(page_title="Solar Power Prediction", page_icon="sun", layout="wide")
 
 # SIDEBAR
 with st.sidebar:
     st.title("Solar FYP")
     st.caption("Weather Condition + Time-Shift Prediction | TNB NEM 3.0")
     st.divider()
+    st.subheader("Your Location")
+    selected_state = st.selectbox("State", list(MALAYSIA_LOCATIONS.keys()))
+    selected_city  = st.selectbox("Nearest City / Town", list(MALAYSIA_LOCATIONS[selected_state].keys()))
+    HOME_LATITUDE, HOME_LONGITUDE = MALAYSIA_LOCATIONS[selected_state][selected_city]
+    st.caption(f"Coordinates: {HOME_LATITUDE:.4f}, {HOME_LONGITUDE:.4f}")
+    st.caption("Used to auto-fetch NASA POWER historical weather and the 7 day Open-Meteo forecast for this area.")
+    st.divider()
     st.subheader("Data Source")
     data_mode = st.radio("Choose source", ["Use sample data", "Upload my CSV / Excel"])
     uploaded = None
     if data_mode == "Upload my CSV / Excel":
-        uploaded = st.file_uploader("Upload file", type=['csv','xlsx'])
+        uploaded = st.file_uploader("Upload FusionSolar file", type=['csv', 'xlsx'])
+        st.caption("Upload your raw FusionSolar export only. Weather data is fetched automatically for the location above.")
     st.divider()
     st.subheader("Model")
     model_type = st.selectbox("Algorithm", ["Random Forest", "XGBoost", "Linear Regression"])
@@ -288,35 +76,41 @@ if uploaded is not None:
     try:
         raw = pd.read_csv(uploaded) if uploaded.name.endswith('.csv') else pd.read_excel(uploaded)
         for col in raw.columns:
-            if any(k in col.lower() for k in ['time','date','datetime']):
+            if any(k in col.lower() for k in ['time', 'date', 'datetime']):
                 raw.rename(columns={col: 'timestamp'}, inplace=True)
                 raw['timestamp'] = pd.to_datetime(raw['timestamp'])
                 break
         for col in raw.columns:
-            if any(k in col.lower() for k in ['power','kw','energy','output','yield']):
+            if any(k in col.lower() for k in ['power', 'kw', 'energy', 'output', 'yield']):
                 raw.rename(columns={col: 'power_output_kw'}, inplace=True)
                 break
-        for col in raw.columns:
-            if any(k in col.lower() for k in ['irradiance', 'allsky_sfc_sw_dwn', 'solar_rad']):
-                raw.rename(columns={col: 'irradiance_wm2'}, inplace=True)
-                break
-        for col in raw.columns:
-            if any(k in col.lower() for k in ['cloud_amt', 'cloud amount', 'cloud_cover', 'cloud']):
-                raw.rename(columns={col: 'cloud_amt_pct'}, inplace=True)
-                break
-        for col in raw.columns:
-            if any(k in col.lower() for k in ['t2m', 'temperature', 'temp_c']):
-                raw.rename(columns={col: 'temperature_c'}, inplace=True)
-                break
-        missing = [c for c in ['irradiance_wm2','cloud_amt_pct'] if c not in raw.columns]
-        if missing:
-            st.sidebar.warning(
-                f"Missing columns for weather classification: {', '.join(missing)}. "
-                "Weather condition will show as Unknown. Merge NASA POWER data with "
-                "irradiance and cloud amount columns to enable this feature."
-            )
-        st.sidebar.success(f"Loaded {len(raw):,} rows.")
-        using_sample = False
+
+        if 'timestamp' not in raw.columns or 'power_output_kw' not in raw.columns:
+            st.sidebar.error("Could not detect timestamp or power output columns. Using sample data.")
+            raw = generate_sample_data()
+        else:
+            raw = raw.set_index('timestamp').resample('h')['power_output_kw'].mean().reset_index()
+            raw['power_output_kw'] = raw['power_output_kw'].clip(lower=0)
+
+            with st.spinner("Fetching matching NASA POWER weather data for your location..."):
+                raw, n_pending = merge_with_nasa_power(raw, HOME_LATITUDE, HOME_LONGITUDE)
+
+            if n_pending > 0:
+                st.sidebar.warning(
+                    f"{n_pending} recent hour(s) are within NASA POWER's typical "
+                    f"{NASA_LATENCY_DAYS}-day data latency window and have no weather "
+                    f"data yet. These rows are excluded from weather-based analysis "
+                    f"until NASA POWER publishes them."
+                )
+                raw = raw[~raw['weather_data_pending']].drop(columns=['weather_data_pending'])
+            elif 'weather_data_pending' in raw.columns:
+                raw = raw.drop(columns=['weather_data_pending'])
+
+            st.sidebar.success(f"Loaded {len(raw):,} hourly rows with weather data auto-fetched for {selected_city}, {selected_state}.")
+            using_sample = False
+    except requests.exceptions.RequestException as e:
+        st.sidebar.error(f"Could not reach NASA POWER: {e}. Using sample data.")
+        raw = generate_sample_data()
     except Exception as e:
         st.sidebar.error(f"Error: {e}. Using sample data.")
         raw = generate_sample_data()
@@ -329,7 +123,7 @@ df = engineer_features(raw)
 st.title("Weather-Condition and Time-Shift Solar Power Prediction")
 st.caption("Residential solar forecast | Sunny, Cloudy, Rainy classification | TNB NEM 3.0 cost analysis | Malaysia")
 if using_sample:
-    st.info("Showing sample data (180 days) with simulated weather conditions. Upload your merged FusionSolar + NASA POWER export in the sidebar to use real data.")
+    st.info("Showing sample data (180 days) with simulated weather conditions. Upload your FusionSolar export in the sidebar, weather data is fetched automatically.")
 st.divider()
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -350,7 +144,7 @@ with tab1:
     c4.metric("Avg Daily Output",   f"{avg_daily:.2f} kWh/day")
 
     st.subheader("Weather Condition Breakdown")
-    daytime = df[df['weather_condition'].isin(['Sunny','Cloudy','Rainy'])]
+    daytime = df[df['weather_condition'].isin(['Sunny', 'Cloudy', 'Rainy'])]
     if len(daytime) > 0:
         wc_counts = daytime['weather_condition'].value_counts()
         wc1, wc2, wc3 = st.columns(3)
@@ -361,14 +155,14 @@ with tab1:
         st.caption("Weather condition data not available for this dataset.")
 
     st.subheader("Data Preview")
-    preview_cols = ['timestamp','power_output_kw','time_window','weather_condition']
-    for opt in ['irradiance_wm2','cloud_amt_pct','temperature_c']:
+    preview_cols = ['timestamp', 'power_output_kw', 'time_window', 'weather_condition']
+    for opt in ['irradiance_wm2', 'cloud_amt_pct', 'temperature_c']:
         if opt in df.columns: preview_cols.append(opt)
     st.dataframe(df[preview_cols].head(48), use_container_width=True)
 
     st.subheader("Daily Generation Over Time")
     daily_gen = df.groupby(df['timestamp'].dt.date)['power_output_kw'].sum().reset_index()
-    daily_gen.columns = ['date','kWh']
+    daily_gen.columns = ['date', 'kWh']
     st.line_chart(daily_gen.set_index('date'))
 
 # TAB 2 - TIME-OF-DAY ANALYSIS
@@ -376,10 +170,10 @@ with tab2:
     st.subheader("Average Power Output by Hour of Day")
     hourly = df.groupby('hour')['power_output_kw'].mean()
     WIN_COLORS = {
-        'Morning (6am-10am)':    '#3B82F6',
-        'Midday Peak (10am-2pm)':'#F59E0B',
-        'Afternoon (2pm-6pm)':   '#10B981',
-        'Off-Peak (6pm-6am)':    '#9CA3AF',
+        'Morning (6am-10am)':     '#3B82F6',
+        'Midday Peak (10am-2pm)': '#F59E0B',
+        'Afternoon (2pm-6pm)':    '#10B981',
+        'Off-Peak (6pm-6am)':     '#9CA3AF',
     }
     bar_colors = [WIN_COLORS[label_window(h)] for h in range(24)]
     fig, ax = plt.subplots(figsize=(11, 4))
@@ -389,8 +183,8 @@ with tab2:
     ax.set_xticks(range(24))
     ax.set_xticklabels([f'{h:02d}:00' for h in range(24)], rotation=45, ha='right', fontsize=8)
     ax.grid(axis='y', alpha=0.25, linestyle='--')
-    ax.spines[['top','right']].set_visible(False)
-    patches = [mpatches.Patch(color=v, label=k) for k,v in WIN_COLORS.items()]
+    ax.spines[['top', 'right']].set_visible(False)
+    patches = [mpatches.Patch(color=v, label=k) for k, v in WIN_COLORS.items()]
     ax.legend(handles=patches, fontsize=9)
     plt.tight_layout()
     st.pyplot(fig); plt.close()
@@ -402,34 +196,34 @@ with tab2:
     st.dataframe(win_stats, use_container_width=True)
 
     st.subheader("Average Power Output by Weather Condition")
-    daytime = df[df['weather_condition'].isin(['Sunny','Cloudy','Rainy'])]
+    daytime = df[df['weather_condition'].isin(['Sunny', 'Cloudy', 'Rainy'])]
     if len(daytime) > 0:
         weather_stats = (daytime.groupby('weather_condition')['power_output_kw']
                           .agg(Avg_kW='mean', Peak_kW='max', Hours='count')
-                          .round(3).reindex(['Sunny','Cloudy','Rainy']))
+                          .round(3).reindex(['Sunny', 'Cloudy', 'Rainy']))
         fig_w, ax_w = plt.subplots(figsize=(8, 3.5))
         wc_bar_colors = [WEATHER_COLORS[w] for w in weather_stats.index]
         ax_w.bar(weather_stats.index, weather_stats['Avg_kW'], color=wc_bar_colors, alpha=0.88, width=0.6)
         ax_w.set_ylabel('Avg Power Output (kW)')
         ax_w.grid(axis='y', alpha=0.25, linestyle='--')
-        ax_w.spines[['top','right']].set_visible(False)
+        ax_w.spines[['top', 'right']].set_visible(False)
         plt.tight_layout()
         st.pyplot(fig_w); plt.close()
         st.dataframe(weather_stats, use_container_width=True)
     else:
-        st.caption("Weather condition breakdown not available. Merge NASA POWER irradiance and cloud amount data to enable this chart.")
+        st.caption("Weather condition breakdown not available.")
 
     st.subheader("Generation by Time Window and Weather Condition")
     if len(daytime) > 0:
-        cross = (daytime.groupby(['time_window','weather_condition'])['power_output_kw']
+        cross = (daytime.groupby(['time_window', 'weather_condition'])['power_output_kw']
                  .mean().unstack('weather_condition').round(3))
-        cross = cross.reindex(columns=[c for c in ['Sunny','Cloudy','Rainy'] if c in cross.columns])
+        cross = cross.reindex(columns=[c for c in ['Sunny', 'Cloudy', 'Rainy'] if c in cross.columns])
         st.dataframe(cross, use_container_width=True)
     else:
         st.caption("Requires weather condition data.")
 
     st.subheader("Monthly Heatmap (avg kW per hour)")
-    pivot = df.groupby(['month','hour'])['power_output_kw'].mean().unstack('hour').fillna(0)
+    pivot = df.groupby(['month', 'hour'])['power_output_kw'].mean().unstack('hour').fillna(0)
     fig2, ax2 = plt.subplots(figsize=(13, 4))
     im = ax2.imshow(pivot.values, aspect='auto', cmap='YlOrRd', origin='upper')
     ax2.set_yticks(range(len(pivot.index)))
@@ -463,7 +257,7 @@ with tab3:
              color='#F59E0B', linewidth=1.2, label='Predicted', linestyle='--')
     ax3.set_xlabel('Hours'); ax3.set_ylabel('Power Output (kW)')
     ax3.legend(fontsize=10); ax3.grid(alpha=0.2, linestyle='--')
-    ax3.spines[['top','right']].set_visible(False)
+    ax3.spines[['top', 'right']].set_visible(False)
     plt.tight_layout()
     st.pyplot(fig3); plt.close()
 
@@ -476,11 +270,11 @@ with tab3:
         mask = window_labels == win
         a, p = y_test[mask].values, y_pred[mask]
         win_rows.append({
-            'Time Window':        win,
-            'Actual Avg (kW)':   round(a.mean(), 3),
-            'Predicted Avg (kW)':round(p.mean(), 3),
-            'MAE (kW)':          round(mean_absolute_error(a, p), 4),
-            'R2':                round(r2_score(a, p) if len(a) > 1 else 0, 4),
+            'Time Window':         win,
+            'Actual Avg (kW)':    round(a.mean(), 3),
+            'Predicted Avg (kW)': round(p.mean(), 3),
+            'MAE (kW)':           round(mean_absolute_error(a, p), 4),
+            'R2':                 round(r2_score(a, p) if len(a) > 1 else 0, 4),
         })
     st.dataframe(pd.DataFrame(win_rows).set_index('Time Window'), use_container_width=True)
 
@@ -495,7 +289,7 @@ with tab3:
                 continue
             a, p = y_test[mask].values, y_pred[mask]
             wc_rows.append({
-                'Weather Condition':   wc,
+                'Weather Condition':  wc,
                 'Actual Avg (kW)':    round(a.mean(), 3),
                 'Predicted Avg (kW)': round(p.mean(), 3),
                 'MAE (kW)':           round(mean_absolute_error(a, p), 4),
@@ -518,7 +312,7 @@ with tab3:
         ax4.barh(imp_df['Feature'], imp_df['Importance'], color=bar_color, alpha=0.85)
         ax4.set_xlabel('Importance')
         ax4.grid(axis='x', alpha=0.25, linestyle='--')
-        ax4.spines[['top','right']].set_visible(False)
+        ax4.spines[['top', 'right']].set_visible(False)
         plt.tight_layout()
         st.pyplot(fig4); plt.close()
 
@@ -531,10 +325,10 @@ with tab4:
     total_off   = savings_df['solar_offset_kwh'].sum()
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Savings",        f"RM {total_saved:,.2f}")
-    c2.metric("Monthly Avg Savings",  f"RM {monthly_avg:,.2f}/month")
-    c3.metric("Total Solar Generated",f"{total_solar:,.1f} kWh")
-    c4.metric("Total Grid Offset",    f"{total_off:,.1f} kWh")
+    c1.metric("Total Savings",         f"RM {total_saved:,.2f}")
+    c2.metric("Monthly Avg Savings",   f"RM {monthly_avg:,.2f}/month")
+    c3.metric("Total Solar Generated", f"{total_solar:,.1f} kWh")
+    c4.metric("Total Grid Offset",     f"{total_off:,.1f} kWh")
 
     st.subheader("Daily Savings (RM)")
     fig5, ax5 = plt.subplots(figsize=(12, 3))
@@ -542,18 +336,18 @@ with tab4:
     ax5.plot(savings_df['date'], savings_df['saving_rm'], color='#059669', linewidth=0.8)
     ax5.set_ylabel('Savings (RM)')
     ax5.grid(alpha=0.2, linestyle='--')
-    ax5.spines[['top','right']].set_visible(False)
+    ax5.spines[['top', 'right']].set_visible(False)
     plt.tight_layout()
     st.pyplot(fig5); plt.close()
 
     st.subheader("Monthly Bill Comparison")
     monthly_tbl = (savings_df
                    .groupby(savings_df['date'].dt.to_period('M'))[[
-                       'bill_without_solar_rm','bill_with_solar_rm',
-                       'saving_rm','solar_generated_kwh']]
+                       'bill_without_solar_rm', 'bill_with_solar_rm',
+                       'saving_rm', 'solar_generated_kwh']]
                    .sum().round(2))
-    monthly_tbl.columns = ['Without Solar (RM)','With Solar (RM)',
-                            'Savings (RM)','Solar Generated (kWh)']
+    monthly_tbl.columns = ['Without Solar (RM)', 'With Solar (RM)',
+                            'Savings (RM)', 'Solar Generated (kWh)']
     st.dataframe(monthly_tbl, use_container_width=True)
 
     st.subheader("Best Times to Run High-Consumption Appliances")
@@ -561,9 +355,12 @@ with tab4:
     win_avg    = solar_only.groupby('time_window')['power_output_kw'].mean()
     recs = []
     for win, avg_kw in win_avg.items():
-        if avg_kw >= 2.0:  rec = "Best, run heavy appliances (washing machine, aircon)"
-        elif avg_kw >= 1.0: rec = "Moderate, light appliances only (fans, TV)"
-        else:               rec = "Avoid, low solar, drawing from grid"
+        if avg_kw >= 2.0:
+            rec = "Best, run heavy appliances (washing machine, aircon)"
+        elif avg_kw >= 1.0:
+            rec = "Moderate, light appliances only (fans, TV)"
+        else:
+            rec = "Avoid, low solar, drawing from grid"
         recs.append({
             'Time Window':           win,
             'Avg Solar Output (kW)': round(avg_kw, 2),
@@ -583,7 +380,8 @@ with tab4:
 with tab5:
     st.subheader("7 Day Solar Generation Forecast")
     st.caption(
-        f"Forecast for installation at latitude {HOME_LATITUDE}, longitude {HOME_LONGITUDE}, "
+        f"Forecast for {selected_city}, {selected_state} "
+        f"(latitude {HOME_LATITUDE:.4f}, longitude {HOME_LONGITUDE:.4f}), "
         f"using live weather forecast data from Open-Meteo (no historical replay, this is a real forecast)."
     )
 
@@ -593,9 +391,9 @@ with tab5:
     if st.session_state.get("run_forecast", False):
         try:
             with st.spinner("Fetching weather forecast and running predictions..."):
-                fc_raw = fetch_weather_forecast(HOME_LATITUDE, HOME_LONGITUDE, days=7)
+                fc_raw      = fetch_weather_forecast(HOME_LATITUDE, HOME_LONGITUDE, days=7)
                 fc_features = build_forecast_features(fc_raw, df)
-                fc_result = predict_forecast(clf, fc_features, feat_names)
+                fc_result   = predict_forecast(clf, fc_features, feat_names)
 
             st.success(f"Forecast generated for {fc_result['date'].nunique()} days ahead.")
 
@@ -610,18 +408,18 @@ with tab5:
                     color='#F59E0B', alpha=0.85)
             ax6.set_ylabel('Predicted kWh')
             ax6.grid(axis='y', alpha=0.25, linestyle='--')
-            ax6.spines[['top','right']].set_visible(False)
+            ax6.spines[['top', 'right']].set_visible(False)
             plt.xticks(rotation=30, ha='right')
             plt.tight_layout()
             st.pyplot(fig6); plt.close()
 
             st.subheader("Hourly Forecast Detail")
-            hourly_cols = ['timestamp','hour','weather_condition','irradiance_wm2',
-                            'cloud_amt_pct','temperature_c','predicted_kw']
+            hourly_cols = ['timestamp', 'hour', 'weather_condition', 'irradiance_wm2',
+                            'cloud_amt_pct', 'temperature_c', 'predicted_kw']
             st.dataframe(fc_result[hourly_cols].round(2), use_container_width=True, height=300)
 
             st.subheader("Forecasted Weather Condition Mix")
-            daytime_fc = fc_result[fc_result['weather_condition'].isin(['Sunny','Cloudy','Rainy'])]
+            daytime_fc = fc_result[fc_result['weather_condition'].isin(['Sunny', 'Cloudy', 'Rainy'])]
             if len(daytime_fc) > 0:
                 wc_counts = daytime_fc['weather_condition'].value_counts()
                 fw1, fw2, fw3 = st.columns(3)
