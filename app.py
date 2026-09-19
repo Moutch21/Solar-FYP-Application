@@ -236,8 +236,12 @@ with tab2:
 # TAB 3 - PREDICTION MODEL
 with tab3:
     st.subheader(f"Training {model_type}")
-    with st.spinner("Training model, please wait..."):
-        clf, X_test, y_test, y_pred, metrics, feat_names = train_model(df, model_type)
+    try:
+        with st.spinner("Training model, please wait..."):
+            clf, X_test, y_test, y_pred, metrics, feat_names = train_model(df, model_type)
+    except ValueError as e:
+        st.error(f"Could not train the model: {e}")
+        st.stop()
 
     c1, c2, c3 = st.columns(3)
     c1.metric("MAE (kW)",  metrics['MAE'],  help="Mean Absolute Error, lower is better")

@@ -23,13 +23,34 @@ def train_model(df, model_type):
     randomly shuffled, to avoid leaking future data into training)
     and returns the fitted model plus test set predictions and
     evaluation metrics.
+
+    A column is only used as a feature if it actually contains real
+    values, not merely if the column exists. This matters because
+    irradiance_wm2, temperature_c, and weather_code can be present in
+    the dataframe but entirely empty, for example when the NASA POWER
+    merge fails or when most uploaded rows fall inside NASA POWER's
+    known data latency window. Including an all empty column would
+    cause dropna to remove almost every row, leaving too few samples
+    for train_test_split and crashing with a ValueError.
     """
     features = FEATURES.copy()
-    if 'irradiance_wm2' in df.columns: features.append('irradiance_wm2')
-    if 'temperature_c'  in df.columns: features.append('temperature_c')
-    if 'weather_code'   in df.columns: features.append('weather_code')
+    for col in ['irradiance_wm2', 'temperature_c', 'weather_code']:
+        if col in df.columns and df[col].notna().sum() > 0:
+            features.append(col)
 
     clean = df.dropna(subset=features + ['power_output_kw'])
+
+    if len(clean) < 10:
+        raise ValueError(
+            f"Only {len(clean)} usable row(s) remain after removing missing "
+            "values, which is too few to train a model. This usually means "
+            "the weather data merge did not return results for most of your "
+            "uploaded rows, for example if the dates fall within NASA "
+            "POWER's data latency window or the request failed. Try a date "
+            "range further in the past, or use the sample data to confirm "
+            "the app itself is working."
+        )
+
     X, y  = clean[features], clean['power_output_kw']
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
 
