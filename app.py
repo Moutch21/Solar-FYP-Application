@@ -27,7 +27,7 @@ warnings.filterwarnings('ignore')
 
 from locations import MALAYSIA_LOCATIONS
 from weather import WEATHER_COLORS, merge_with_nasa_power, fetch_weather_forecast, NASA_LATENCY_DAYS
-from data_pipeline import generate_sample_data, label_window, engineer_features, build_forecast_features
+from data_pipeline import generate_sample_data, label_window, engineer_features, build_forecast_features, load_plant_report
 from models import train_model, predict_forecast
 from cost_calculator import (
     calculate_savings,
@@ -50,18 +50,18 @@ with st.sidebar:
     st.caption("Used to auto-fetch NASA POWER historical weather and the 7 day Open-Meteo forecast for this area.")
     st.divider()
     st.subheader("Data Source")
-    data_mode = st.radio("Choose source", ["Use sample data", "Upload my CSV / Excel"])
+    data_mode = st.radio("Choose source", ["Use sample data", "Upload my Plant Report"])
     uploaded = None
-    if data_mode == "Upload my CSV / Excel":
-        uploaded = st.file_uploader("Upload FusionSolar file", type=['csv', 'xlsx'])
-        st.caption("Upload your raw FusionSolar export only. Weather data is fetched automatically for the location above.")
+    if data_mode == "Upload my Plant Report":
+        uploaded = st.file_uploader("Upload FusionSolar Plant Report", type=['csv', 'xlsx'])
+        st.caption("Upload your FusionSolar Plant Report export (Statistical period, PV Yield, Consumption, Export, Import columns). Weather data is fetched automatically for the location above.")
     st.divider()
     st.subheader("Model")
     model_type = st.selectbox("Algorithm", ["Random Forest", "XGBoost", "Linear Regression"])
     st.caption("Random Forest: primary model. XGBoost: gradient boosting, higher accuracy but needs more tuning. Linear Regression: baseline.")
     st.divider()
-    st.subheader("Your Household")
-    monthly_kwh = st.slider("Monthly consumption (kWh)", 300, 1500, 600, 50)
+    st.subheader("Your Household (fallback only)")
+    monthly_kwh = st.slider("Monthly consumption (kWh), used only if your file has no real consumption data", 300, 1500, 600, 50)
     st.caption(f"Daily equivalent: {monthly_kwh/30:.1f} kWh/day")
     st.divider()
     st.subheader("TNB NEM 3.0 Rates")
@@ -74,40 +74,28 @@ with st.sidebar:
 using_sample = True
 if uploaded is not None:
     try:
-        raw = pd.read_csv(uploaded) if uploaded.name.endswith('.csv') else pd.read_excel(uploaded)
-        for col in raw.columns:
-            if any(k in col.lower() for k in ['time', 'date', 'datetime']):
-                raw.rename(columns={col: 'timestamp'}, inplace=True)
-                raw['timestamp'] = pd.to_datetime(raw['timestamp'])
-                break
-        for col in raw.columns:
-            if any(k in col.lower() for k in ['power', 'kw', 'energy', 'output', 'yield']):
-                raw.rename(columns={col: 'power_output_kw'}, inplace=True)
-                break
+        raw, has_real_consumption = load_plant_report(uploaded)
 
-        if 'timestamp' not in raw.columns or 'power_output_kw' not in raw.columns:
-            st.sidebar.error("Could not detect timestamp or power output columns. Using sample data.")
-            raw = generate_sample_data()
-        else:
-            raw = raw.set_index('timestamp').resample('h')['power_output_kw'].mean().reset_index()
-            raw['power_output_kw'] = raw['power_output_kw'].clip(lower=0)
+        with st.spinner("Fetching matching NASA POWER weather data for your location..."):
+            raw, n_pending = merge_with_nasa_power(raw, HOME_LATITUDE, HOME_LONGITUDE)
 
-            with st.spinner("Fetching matching NASA POWER weather data for your location..."):
-                raw, n_pending = merge_with_nasa_power(raw, HOME_LATITUDE, HOME_LONGITUDE)
+        if n_pending > 0:
+            st.sidebar.warning(
+                f"{n_pending} recent hour(s) are within NASA POWER's typical "
+                f"{NASA_LATENCY_DAYS}-day data latency window and have no weather "
+                f"data yet. These rows are excluded from weather-based analysis "
+                f"until NASA POWER publishes them."
+            )
+            raw = raw[~raw['weather_data_pending']].drop(columns=['weather_data_pending'])
+        elif 'weather_data_pending' in raw.columns:
+            raw = raw.drop(columns=['weather_data_pending'])
 
-            if n_pending > 0:
-                st.sidebar.warning(
-                    f"{n_pending} recent hour(s) are within NASA POWER's typical "
-                    f"{NASA_LATENCY_DAYS}-day data latency window and have no weather "
-                    f"data yet. These rows are excluded from weather-based analysis "
-                    f"until NASA POWER publishes them."
-                )
-                raw = raw[~raw['weather_data_pending']].drop(columns=['weather_data_pending'])
-            elif 'weather_data_pending' in raw.columns:
-                raw = raw.drop(columns=['weather_data_pending'])
-
-            st.sidebar.success(f"Loaded {len(raw):,} hourly rows with weather data auto-fetched for {selected_city}, {selected_state}.")
-            using_sample = False
+        mode_note = "with real measured consumption data" if has_real_consumption else "using estimated consumption (slider)"
+        st.sidebar.success(f"Loaded {len(raw):,} hourly rows {mode_note}, weather auto-fetched for {selected_city}, {selected_state}.")
+        using_sample = False
+    except ValueError as e:
+        st.sidebar.error(f"{e} Using sample data instead.")
+        raw = generate_sample_data()
     except requests.exceptions.RequestException as e:
         st.sidebar.error(f"Could not reach NASA POWER: {e}. Using sample data.")
         raw = generate_sample_data()
@@ -123,7 +111,7 @@ df = engineer_features(raw)
 st.title("Weather-Condition and Time-Shift Solar Power Prediction")
 st.caption("Residential solar forecast | Sunny, Cloudy, Rainy classification | TNB NEM 3.0 cost analysis | Malaysia")
 if using_sample:
-    st.info("Showing sample data (180 days) with simulated weather conditions. Upload your FusionSolar export in the sidebar, weather data is fetched automatically.")
+    st.info("Showing sample data (180 days) with simulated weather and consumption. Upload your FusionSolar Plant Report in the sidebar to use real data.")
 st.divider()
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -143,6 +131,16 @@ with tab1:
     c3.metric("Peak Power Output",  f"{peak_pow:.2f} kW")
     c4.metric("Avg Daily Output",   f"{avg_daily:.2f} kWh/day")
 
+    if 'consumption_kwh' in df.columns and df['consumption_kwh'].notna().sum() > 0:
+        st.subheader("Real Measured Household Data")
+        total_consumption = df['consumption_kwh'].sum()
+        total_export = df['export_kwh'].sum() if 'export_kwh' in df.columns else 0
+        total_import = df['import_kwh'].sum() if 'import_kwh' in df.columns else 0
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("Total Consumption", f"{total_consumption:,.1f} kWh")
+        mc2.metric("Total Exported to Grid", f"{total_export:,.1f} kWh")
+        mc3.metric("Total Imported from Grid", f"{total_import:,.1f} kWh")
+
     st.subheader("Weather Condition Breakdown")
     daytime = df[df['weather_condition'].isin(['Sunny', 'Cloudy', 'Rainy'])]
     if len(daytime) > 0:
@@ -156,7 +154,7 @@ with tab1:
 
     st.subheader("Data Preview")
     preview_cols = ['timestamp', 'power_output_kw', 'time_window', 'weather_condition']
-    for opt in ['irradiance_wm2', 'cloud_amt_pct', 'temperature_c']:
+    for opt in ['consumption_kwh', 'export_kwh', 'import_kwh', 'irradiance_wm2', 'cloud_amt_pct', 'temperature_c']:
         if opt in df.columns: preview_cols.append(opt)
     st.dataframe(df[preview_cols].head(48), use_container_width=True)
 
@@ -318,11 +316,16 @@ with tab3:
 
 # TAB 4 - COST & SAVINGS
 with tab4:
-    savings_df  = calculate_savings(df, monthly_kwh)
+    savings_df, is_measured = calculate_savings(df, monthly_kwh)
     total_saved = savings_df['saving_rm'].sum()
     monthly_avg = savings_df.groupby(savings_df['date'].dt.to_period('M'))['saving_rm'].sum().mean()
     total_solar = savings_df['solar_generated_kwh'].sum()
     total_off   = savings_df['solar_offset_kwh'].sum()
+
+    if is_measured:
+        st.success("Using real measured consumption, export, and import data from your Plant Report, not an estimate.")
+    else:
+        st.info(f"No real consumption data found, using the estimated monthly consumption of {monthly_kwh} kWh from the sidebar slider.")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Savings",         f"RM {total_saved:,.2f}")
@@ -373,7 +376,9 @@ with tab4:
     st.divider()
     st.caption(
         f"TNB NEM 3.0 total rate: {TNB_TOTAL_RATE*100:.2f} sen/kWh for usage up to 1,500 kWh/month. "
-        f"Monthly consumption set to {monthly_kwh} kWh. Adjust the slider in the sidebar to match your TNB bill."
+        + ("Savings calculated from your real measured consumption and grid import/export data."
+           if is_measured else
+           f"Monthly consumption set to {monthly_kwh} kWh. Adjust the slider in the sidebar to match your TNB bill.")
     )
 
 # TAB 5 - 7 DAY FORECAST
@@ -429,7 +434,10 @@ with tab5:
 
             st.subheader("Estimated Savings for the Week Ahead")
             week_total_kwh = daily_forecast['Predicted kWh'].sum()
-            week_saving = min(week_total_kwh, monthly_kwh / 30 * 7) * TNB_TOTAL_RATE
+            avg_daily_consumption = (df['consumption_kwh'].sum() / df['timestamp'].dt.date.nunique()
+                                      if 'consumption_kwh' in df.columns and df['consumption_kwh'].notna().sum() > 0
+                                      else monthly_kwh / 30)
+            week_saving = min(week_total_kwh, avg_daily_consumption * 7) * TNB_TOTAL_RATE
             fs1, fs2 = st.columns(2)
             fs1.metric("Total Predicted Generation (7d)", f"{week_total_kwh:,.1f} kWh")
             fs2.metric("Estimated Savings (7d)", f"RM {week_saving:,.2f}")
