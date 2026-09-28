@@ -19,8 +19,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
+import plotly.express as px
+import plotly.graph_objects as go
 from sklearn.metrics import mean_absolute_error, r2_score
 import warnings
 warnings.filterwarnings('ignore')
@@ -161,31 +161,32 @@ with tab1:
     st.subheader("Daily Generation Over Time")
     daily_gen = df.groupby(df['timestamp'].dt.date)['power_output_kw'].sum().reset_index()
     daily_gen.columns = ['date', 'kWh']
-    st.line_chart(daily_gen.set_index('date'))
+    fig_daily = px.line(daily_gen, x='date', y='kWh', markers=True,
+                         labels={'date': 'Date', 'kWh': 'Generation (kWh)'})
+    fig_daily.update_traces(line_color='#F59E0B', hovertemplate='%{x|%d %b %Y}<br>%{y:.2f} kWh<extra></extra>')
+    fig_daily.update_layout(template='plotly_white', height=350, margin=dict(t=20, b=20))
+    st.plotly_chart(fig_daily)
 
 # TAB 2 - TIME-OF-DAY ANALYSIS
 with tab2:
     st.subheader("Average Power Output by Hour of Day")
-    hourly = df.groupby('hour')['power_output_kw'].mean()
+    hourly = df.groupby('hour')['power_output_kw'].mean().reset_index()
+    hourly.columns = ['hour', 'avg_kw']
     WIN_COLORS = {
         'Morning (6am-10am)':     '#3B82F6',
         'Midday Peak (10am-2pm)': '#F59E0B',
         'Afternoon (2pm-6pm)':    '#10B981',
         'Off-Peak (6pm-6am)':     '#9CA3AF',
     }
-    bar_colors = [WIN_COLORS[label_window(h)] for h in range(24)]
-    fig, ax = plt.subplots(figsize=(11, 4))
-    ax.bar(hourly.index, hourly.values, color=bar_colors, alpha=0.88, width=0.85)
-    ax.set_xlabel('Hour of Day')
-    ax.set_ylabel('Avg Power Output (kW)')
-    ax.set_xticks(range(24))
-    ax.set_xticklabels([f'{h:02d}:00' for h in range(24)], rotation=45, ha='right', fontsize=8)
-    ax.grid(axis='y', alpha=0.25, linestyle='--')
-    ax.spines[['top', 'right']].set_visible(False)
-    patches = [mpatches.Patch(color=v, label=k) for k, v in WIN_COLORS.items()]
-    ax.legend(handles=patches, fontsize=9)
-    plt.tight_layout()
-    st.pyplot(fig); plt.close()
+    hourly['time_window'] = hourly['hour'].apply(label_window)
+    hourly['hour_label'] = hourly['hour'].apply(lambda h: f'{h:02d}:00')
+    fig_hourly = px.bar(hourly, x='hour_label', y='avg_kw', color='time_window',
+                         color_discrete_map=WIN_COLORS,
+                         category_orders={'hour_label': [f'{h:02d}:00' for h in range(24)]},
+                         labels={'hour_label': 'Hour of Day', 'avg_kw': 'Avg Power Output (kW)', 'time_window': 'Time Window'},
+                         hover_data={'hour_label': True, 'avg_kw': ':.2f', 'time_window': True})
+    fig_hourly.update_layout(template='plotly_white', height=420, legend=dict(orientation='h', y=-0.25))
+    st.plotly_chart(fig_hourly)
 
     st.subheader("Time Window Summary")
     win_stats = (df.groupby('time_window')['power_output_kw']
@@ -199,14 +200,12 @@ with tab2:
         weather_stats = (daytime.groupby('weather_condition')['power_output_kw']
                           .agg(Avg_kW='mean', Peak_kW='max', Hours='count')
                           .round(3).reindex(['Sunny', 'Cloudy', 'Rainy']))
-        fig_w, ax_w = plt.subplots(figsize=(8, 3.5))
-        wc_bar_colors = [WEATHER_COLORS[w] for w in weather_stats.index]
-        ax_w.bar(weather_stats.index, weather_stats['Avg_kW'], color=wc_bar_colors, alpha=0.88, width=0.6)
-        ax_w.set_ylabel('Avg Power Output (kW)')
-        ax_w.grid(axis='y', alpha=0.25, linestyle='--')
-        ax_w.spines[['top', 'right']].set_visible(False)
-        plt.tight_layout()
-        st.pyplot(fig_w); plt.close()
+        fig_w = px.bar(weather_stats.reset_index(), x='weather_condition', y='Avg_kW',
+                       color='weather_condition', color_discrete_map=WEATHER_COLORS,
+                       labels={'weather_condition': 'Weather Condition', 'Avg_kW': 'Avg Power Output (kW)'},
+                       hover_data={'weather_condition': True, 'Avg_kW': ':.2f'})
+        fig_w.update_layout(template='plotly_white', height=350, showlegend=False)
+        st.plotly_chart(fig_w)
         st.dataframe(weather_stats, use_container_width=True)
     else:
         st.caption("Weather condition breakdown not available.")
@@ -222,16 +221,16 @@ with tab2:
 
     st.subheader("Monthly Heatmap (avg kW per hour)")
     pivot = df.groupby(['month', 'hour'])['power_output_kw'].mean().unstack('hour').fillna(0)
-    fig2, ax2 = plt.subplots(figsize=(13, 4))
-    im = ax2.imshow(pivot.values, aspect='auto', cmap='YlOrRd', origin='upper')
-    ax2.set_yticks(range(len(pivot.index)))
-    ax2.set_yticklabels([f'Month {m}' for m in pivot.index], fontsize=9)
-    ax2.set_xticks(range(24))
-    ax2.set_xticklabels([f'{h:02d}' for h in range(24)], fontsize=8)
-    ax2.set_xlabel('Hour of Day')
-    plt.colorbar(im, ax=ax2, label='Avg kW')
-    plt.tight_layout()
-    st.pyplot(fig2); plt.close()
+    fig_heat = go.Figure(data=go.Heatmap(
+        z=pivot.values,
+        x=[f'{h:02d}:00' for h in pivot.columns],
+        y=[f'Month {m}' for m in pivot.index],
+        colorscale='YlOrRd',
+        colorbar=dict(title='Avg kW'),
+        hovertemplate='%{y}<br>%{x}<br>%{z:.2f} kW<extra></extra>',
+    ))
+    fig_heat.update_layout(template='plotly_white', height=380, xaxis_title='Hour of Day')
+    st.plotly_chart(fig_heat)
 
 # TAB 3 - PREDICTION MODEL
 with tab3:
@@ -252,16 +251,16 @@ with tab3:
 
     st.subheader("Predicted vs Actual, first 7 days of test set")
     plot_n = min(168, len(y_test))
-    fig3, ax3 = plt.subplots(figsize=(12, 4))
-    ax3.plot(range(plot_n), y_test[:plot_n].values,
-             color='#3B82F6', linewidth=1.2, label='Actual')
-    ax3.plot(range(plot_n), y_pred[:plot_n],
-             color='#F59E0B', linewidth=1.2, label='Predicted', linestyle='--')
-    ax3.set_xlabel('Hours'); ax3.set_ylabel('Power Output (kW)')
-    ax3.legend(fontsize=10); ax3.grid(alpha=0.2, linestyle='--')
-    ax3.spines[['top', 'right']].set_visible(False)
-    plt.tight_layout()
-    st.pyplot(fig3); plt.close()
+    fig_pred = go.Figure()
+    fig_pred.add_trace(go.Scatter(x=list(range(plot_n)), y=y_test[:plot_n].values,
+                                   mode='lines', name='Actual', line=dict(color='#3B82F6', width=1.5)))
+    fig_pred.add_trace(go.Scatter(x=list(range(plot_n)), y=y_pred[:plot_n],
+                                   mode='lines', name='Predicted', line=dict(color='#F59E0B', width=1.5, dash='dash')))
+    fig_pred.update_layout(template='plotly_white', height=400,
+                            xaxis_title='Hours', yaxis_title='Power Output (kW)',
+                            legend=dict(orientation='h', y=1.1),
+                            hovermode='x unified')
+    st.plotly_chart(fig_pred)
 
     st.subheader("Accuracy by Time Window")
     hour_approx   = (np.arctan2(X_test['hour_sin'], X_test['hour_cos'])
@@ -310,13 +309,12 @@ with tab3:
         imp_df = (pd.DataFrame({'Feature': feat_names, 'Importance': clf.feature_importances_})
                   .sort_values('Importance', ascending=True))
         bar_color = '#3B82F6' if model_type == 'Random Forest' else '#10B981'
-        fig4, ax4 = plt.subplots(figsize=(7, max(3, len(feat_names) * 0.5)))
-        ax4.barh(imp_df['Feature'], imp_df['Importance'], color=bar_color, alpha=0.85)
-        ax4.set_xlabel('Importance')
-        ax4.grid(axis='x', alpha=0.25, linestyle='--')
-        ax4.spines[['top', 'right']].set_visible(False)
-        plt.tight_layout()
-        st.pyplot(fig4); plt.close()
+        fig_imp = px.bar(imp_df, x='Importance', y='Feature', orientation='h',
+                          labels={'Importance': 'Importance', 'Feature': ''},
+                          hover_data={'Importance': ':.4f'})
+        fig_imp.update_traces(marker_color=bar_color)
+        fig_imp.update_layout(template='plotly_white', height=max(300, len(feat_names) * 40))
+        st.plotly_chart(fig_imp)
 
 # TAB 4 - COST & SAVINGS
 with tab4:
@@ -338,14 +336,12 @@ with tab4:
     c4.metric("Total Grid Offset",     f"{total_off:,.1f} kWh")
 
     st.subheader("Daily Savings (RM)")
-    fig5, ax5 = plt.subplots(figsize=(12, 3))
-    ax5.fill_between(savings_df['date'], savings_df['saving_rm'], color='#10B981', alpha=0.6)
-    ax5.plot(savings_df['date'], savings_df['saving_rm'], color='#059669', linewidth=0.8)
-    ax5.set_ylabel('Savings (RM)')
-    ax5.grid(alpha=0.2, linestyle='--')
-    ax5.spines[['top', 'right']].set_visible(False)
-    plt.tight_layout()
-    st.pyplot(fig5); plt.close()
+    fig_savings = px.area(savings_df, x='date', y='saving_rm',
+                           labels={'date': 'Date', 'saving_rm': 'Savings (RM)'})
+    fig_savings.update_traces(line_color='#059669', fillcolor='rgba(16, 185, 129, 0.35)',
+                               hovertemplate='%{x|%d %b %Y}<br>RM %{y:.2f}<extra></extra>')
+    fig_savings.update_layout(template='plotly_white', height=320, margin=dict(t=20, b=20))
+    st.plotly_chart(fig_savings)
 
     st.subheader("Monthly Bill Comparison")
     monthly_tbl = (savings_df
@@ -412,15 +408,12 @@ with tab5:
             daily_forecast['Predicted kWh'] = daily_forecast['Predicted kWh'].round(2)
 
             st.subheader("Daily Predicted Generation")
-            fig6, ax6 = plt.subplots(figsize=(12, 3.5))
-            ax6.bar(daily_forecast['Date'].astype(str), daily_forecast['Predicted kWh'],
-                    color='#F59E0B', alpha=0.85)
-            ax6.set_ylabel('Predicted kWh')
-            ax6.grid(axis='y', alpha=0.25, linestyle='--')
-            ax6.spines[['top', 'right']].set_visible(False)
-            plt.xticks(rotation=30, ha='right')
-            plt.tight_layout()
-            st.pyplot(fig6); plt.close()
+            fig_fc = px.bar(daily_forecast, x='Date', y='Predicted kWh',
+                             labels={'Date': 'Date', 'Predicted kWh': 'Predicted Generation (kWh)'},
+                             hover_data={'Date': True, 'Predicted kWh': ':.2f'})
+            fig_fc.update_traces(marker_color='#F59E0B')
+            fig_fc.update_layout(template='plotly_white', height=380)
+            st.plotly_chart(fig_fc)
 
             st.subheader("Hourly Forecast Detail")
             hourly_cols = ['timestamp', 'hour', 'weather_condition', 'irradiance_wm2',
