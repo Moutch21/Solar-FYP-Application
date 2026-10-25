@@ -14,6 +14,8 @@ This file depends on weather.py for classify_weather, but nothing in
 weather.py depends back on this file, so there is no circular import.
 """
 
+import re
+
 import numpy as np
 import pandas as pd
 
@@ -22,20 +24,31 @@ from weather import classify_weather, WEATHER_CODE_MAP
 FEATURES = ['hour_sin', 'hour_cos', 'month_sin', 'month_cos',
             'day_of_week', 'is_weekend', 'lag_24h_avg']
 
-# Exact column names expected from a FusionSolar Plant Report export.
-# Exact matching is used, rather than the fuzzy keyword matching this
-# project used previously for the raw inverter export, since this is
-# now the only supported format and its column names are fixed by
-# FusionSolar's own report template.
+def _norm(name):
+    """
+    Lowercases a column name and strips everything except letters and
+    digits, so differences in capitalisation, spacing and unit symbols
+    between FusionSolar export versions (for example "Statistical
+    period" versus "Statistical Period") do not break the match.
+    """
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+# Plant Report columns, keyed by their normalised names. PV Yield and
+# the other energy columns are matched exactly after normalising. The
+# site sensor columns are matched by prefix below, because the unit
+# text after the name differs between export versions.
 PLANT_REPORT_COLUMNS = {
-    "Statistical period":           "timestamp",
-    "PV Yield (kWh)":               "power_output_kw",  # hourly kWh numerically equals avg kW for that hour
-    "Consumption (kWh)":            "consumption_kwh",
-    "Export (kWh)":                 "export_kwh",
-    "Import (kWh)":                 "import_kwh",
-    "Self-consumption (kWh)":       "self_consumption_kwh",
-    "Global Irradiation (kWh/m²)":  "site_irradiance",
-    "Average Temperature (℃)":      "site_temperature",
+    "statisticalperiod":    "timestamp",
+    "pvyieldkwh":           "power_output_kw",  # hourly kWh numerically equals avg kW for that hour
+    "consumptionkwh":       "consumption_kwh",
+    "exportkwh":            "export_kwh",
+    "importkwh":            "import_kwh",
+    "selfconsumptionkwh":   "self_consumption_kwh",
+}
+SITE_SENSOR_PREFIXES = {
+    "globalirradiation":    "site_irradiance",
+    "averagetemperature":   "site_temperature",
 }
 REQUIRED_COLUMNS = ["timestamp", "power_output_kw"]
 
@@ -43,14 +56,14 @@ REQUIRED_COLUMNS = ["timestamp", "power_output_kw"]
 def find_header_row(file, max_scan_rows=5):
     """
     Scans the first few rows of the file to find which row holds the
-    real column headers, identified by the presence of "Statistical
-    period". More robust than hardcoding a fixed header row number,
-    in case FusionSolar shifts the metadata block by a row in a
-    future export.
+    real column headers, identified by a cell reading "Statistical
+    period" in any capitalisation. More robust than hardcoding a fixed
+    header row number, in case FusionSolar shifts the metadata block
+    by a row in a future export.
     """
     preview = pd.read_excel(file, header=None, nrows=max_scan_rows)
     for i, row in preview.iterrows():
-        if row.astype(str).str.contains("Statistical period", na=False).any():
+        if row.map(_norm).eq("statisticalperiod").any():
             return i
     return None
 
@@ -80,7 +93,15 @@ def load_plant_report(file):
     else:
         raw = pd.read_csv(file)
 
-    rename_map = {c: PLANT_REPORT_COLUMNS[c] for c in raw.columns if c in PLANT_REPORT_COLUMNS}
+    rename_map = {}
+    for c in raw.columns:
+        key = _norm(c)
+        if key in PLANT_REPORT_COLUMNS:
+            rename_map[c] = PLANT_REPORT_COLUMNS[key]
+        else:
+            for prefix, target in SITE_SENSOR_PREFIXES.items():
+                if key.startswith(prefix):
+                    rename_map[c] = target
     raw = raw.rename(columns=rename_map)
 
     missing = [c for c in REQUIRED_COLUMNS if c not in raw.columns]
@@ -92,6 +113,19 @@ def load_plant_report(file):
         )
 
     raw["timestamp"] = pd.to_datetime(raw["timestamp"])
+
+    # The model predicts hour by hour, so the file must have one row per
+    # hour. A daily Plant Report (one row per day) cannot be used, so say
+    # so clearly instead of training on a handful of midnight rows.
+    if len(raw) > 1:
+        median_gap = raw["timestamp"].sort_values().diff().dropna().median()
+        if median_gap >= pd.Timedelta(hours=23):
+            raise ValueError(
+                "This Plant Report has one row per day (daily totals), but the "
+                "app predicts hour by hour. Export the Plant Report again at "
+                "hourly granularity, like your August file."
+            )
+
     raw["power_output_kw"] = pd.to_numeric(raw["power_output_kw"], errors="coerce").fillna(0).clip(lower=0)
 
     for col in ["consumption_kwh", "export_kwh", "import_kwh", "self_consumption_kwh"]:
