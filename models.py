@@ -42,13 +42,10 @@ def train_model(df, model_type):
 
     if len(clean) < 10:
         raise ValueError(
-            f"Only {len(clean)} usable row(s) remain after removing missing "
-            "values, which is too few to train a model. This usually means "
-            "the weather data merge did not return results for most of your "
-            "uploaded rows, for example if the dates fall within NASA "
-            "POWER's data latency window or the request failed. Try a date "
-            "range further in the past, or use the sample data to confirm "
-            "the app itself is working."
+            f"There are only {len(clean)} usable hours of data, which is too few. "
+            "This usually happens when the weather data could not be matched to "
+            "your report, for example if the dates are very recent. Try a report "
+            "from further in the past, or use the demo data."
         )
 
     X, y  = clean[features], clean['power_output_kw']

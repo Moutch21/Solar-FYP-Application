@@ -85,8 +85,8 @@ def load_plant_report(file):
         header_row = find_header_row(file)
         if header_row is None:
             raise ValueError(
-                "Could not find a 'Statistical period' header row in this file. "
-                "This does not look like a FusionSolar Plant Report export."
+                "We could not read this file. Please upload the hourly report "
+                "downloaded from the FusionSolar website."
             )
         file.seek(0)
         raw = pd.read_excel(file, header=header_row)
@@ -107,9 +107,8 @@ def load_plant_report(file):
     missing = [c for c in REQUIRED_COLUMNS if c not in raw.columns]
     if missing:
         raise ValueError(
-            f"Missing required column(s): {', '.join(missing)}. "
-            "Expected a FusionSolar Plant Report export with a "
-            "'Statistical period' and 'PV Yield (kWh)' column."
+            "This file is missing the time or solar output column. Please upload "
+            "the hourly report downloaded from the FusionSolar website."
         )
 
     raw["timestamp"] = pd.to_datetime(raw["timestamp"])
@@ -121,9 +120,9 @@ def load_plant_report(file):
         median_gap = raw["timestamp"].sort_values().diff().dropna().median()
         if median_gap >= pd.Timedelta(hours=23):
             raise ValueError(
-                "This Plant Report has one row per day (daily totals), but the "
-                "app predicts hour by hour. Export the Plant Report again at "
-                "hourly granularity, like your August file."
+                "This report has one row per day, but Folaw needs hourly details. "
+                "Please download the report again from FusionSolar with hourly "
+                "details, like your August one."
             )
 
     raw["power_output_kw"] = pd.to_numeric(raw["power_output_kw"], errors="coerce").fillna(0).clip(lower=0)
