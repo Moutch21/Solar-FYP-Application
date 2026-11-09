@@ -45,8 +45,12 @@ def classify_weather(irradiance, cloud_amt, hour):
     """
     if hour < 6 or hour >= 19:
         return 'Night'
-    if pd.isna(irradiance) or pd.isna(cloud_amt):
+    if pd.isna(irradiance):
         return 'Unknown'
+    if pd.isna(cloud_amt):
+        if irradiance >= IRRADIANCE_SUNNY_MIN:
+            return 'Sunny'
+        return 'Rainy' if irradiance <= IRRADIANCE_RAINY_MAX else 'Cloudy'
     if irradiance >= IRRADIANCE_SUNNY_MIN and cloud_amt <= CLOUD_SUNNY_MAX:
         return 'Sunny'
     if irradiance <= IRRADIANCE_RAINY_MAX or cloud_amt >= CLOUD_RAINY_MIN:
@@ -82,17 +86,19 @@ def fetch_weather_forecast(lat, lon, days=7):
     return fc
 
 
-# NASA POWER HISTORICAL AUTO-FETCH AND MERGE
-NASA_LATENCY_DAYS = 3  # NASA POWER typically lags 2-3 days behind real time
+# HISTORICAL WEATHER AUTO FETCH AND MERGE
+MALAYSIA_UTC_OFFSET_HOURS = 8
+NASA_LATENCY_DAYS = 7
+MIN_WEATHER_COVERAGE = 0.8
+WEATHER_COLUMNS = ["irradiance_wm2", "cloud_amt_pct", "temperature_c"]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_nasa_power_historical(lat, lon, start_date, end_date):
     """
-    Automatically pulls hourly ALLSKY_SFC_SW_DWN (irradiance),
-    CLOUD_AMT (cloud amount), and T2M (temperature) from NASA POWER
-    for the given coordinates and date range. No manual download
-    needed from the user.
+    Hourly irradiance, cloud amount and temperature from NASA POWER.
+    Requested in UTC and shifted +8 hours so it lines up with Malaysian
+    local clock time (NASA's default is local solar time, which is off).
     """
     url = "https://power.larc.nasa.gov/api/temporal/hourly/point"
     params = {
@@ -100,49 +106,94 @@ def fetch_nasa_power_historical(lat, lon, start_date, end_date):
         "community":  "RE",
         "longitude":  lon,
         "latitude":   lat,
-        "start":      start_date.strftime("%Y%m%d"),
+        "start":      (start_date - pd.Timedelta(days=1)).strftime("%Y%m%d"),
         "end":        end_date.strftime("%Y%m%d"),
         "format":     "JSON",
+        "time-standard": "UTC",
     }
-    resp = requests.get(url, params=params, timeout=30)
+    resp = requests.get(url, params=params, timeout=45)
     resp.raise_for_status()
     data = resp.json()["properties"]["parameter"]
-
+    irr, cld, tmp = data["ALLSKY_SFC_SW_DWN"], data.get("CLOUD_AMT", {}), data.get("T2M", {})
     records = []
-    for ts_key in data["ALLSKY_SFC_SW_DWN"].keys():
-        dt = pd.to_datetime(ts_key, format="%Y%m%d%H")
-        records.append({
-            "timestamp":      dt,
-            "irradiance_wm2": data["ALLSKY_SFC_SW_DWN"].get(ts_key, np.nan),
-            "cloud_amt_pct":  data["CLOUD_AMT"].get(ts_key, np.nan),
-            "temperature_c":  data["T2M"].get(ts_key, np.nan),
-        })
-    weather_df = pd.DataFrame(records)
-    # NASA POWER uses -999 as a fill value for missing data
-    weather_df.replace(-999, np.nan, inplace=True)
-    return weather_df
+    for k in irr.keys():
+        dt = pd.to_datetime(k, format="%Y%m%d%H") + pd.Timedelta(hours=MALAYSIA_UTC_OFFSET_HOURS)
+        records.append({"timestamp": dt,
+                        "irradiance_wm2": irr.get(k, np.nan),
+                        "cloud_amt_pct":  cld.get(k, np.nan),
+                        "temperature_c":  tmp.get(k, np.nan)})
+    df = pd.DataFrame(records)
+    return df.replace(-999, np.nan)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_open_meteo_historical(lat, lon, start_date, end_date):
+    """Backup source: Open Meteo archive, already in Malaysian local time."""
+    end = min(end_date, pd.Timestamp.now().normalize())
+    params = {
+        "latitude": lat, "longitude": lon,
+        "start_date": start_date.strftime("%Y-%m-%d"),
+        "end_date":   end.strftime("%Y-%m-%d"),
+        "hourly": "shortwave_radiation,cloud_cover,temperature_2m",
+        "timezone": "Asia/Kuala_Lumpur",
+    }
+    resp = requests.get("https://archive-api.open-meteo.com/v1/archive", params=params, timeout=45)
+    resp.raise_for_status()
+    h = resp.json()["hourly"]
+    return pd.DataFrame({
+        "timestamp":      pd.to_datetime(h["time"]),
+        "irradiance_wm2": h["shortwave_radiation"],
+        "cloud_amt_pct":  h["cloud_cover"],
+        "temperature_c":  h["temperature_2m"],
+    })
+
+
+def daytime_coverage(df):
+    """Share of daytime hours (6 to 18) that have an irradiance value."""
+    day = df[(df["timestamp"].dt.hour >= 6) & (df["timestamp"].dt.hour < 19)]
+    if len(day) == 0:
+        return 0.0
+    return float(day["irradiance_wm2"].notna().mean())
+
+
+def merge_with_weather(plant_df, lat, lon):
+    """
+    Adds weather columns to the plant report. Tries NASA POWER, then
+    Open Meteo, keeps the better match. Never raises on a failed
+    fetch: returns NaN weather columns instead.
+    Returns (merged, n_pending, info).
+    """
+    base = plant_df.drop(columns=[c for c in WEATHER_COLUMNS if c in plant_df.columns]).copy()
+    start = base["timestamp"].min().normalize()
+    end   = base["timestamp"].max().normalize()
+
+    best, best_cov, best_src, notes = None, 0.0, None, []
+    for name, fn in (("NASA POWER", fetch_nasa_power_historical),
+                     ("Open Meteo", fetch_open_meteo_historical)):
+        try:
+            wdf = fn(lat, lon, start, end)
+            cand = pd.merge(base[["timestamp"]], wdf, on="timestamp", how="left")
+            cov = daytime_coverage(cand)
+            if cov > best_cov:
+                best, best_cov, best_src = wdf, cov, name
+            if cov >= MIN_WEATHER_COVERAGE:
+                break
+        except (requests.exceptions.RequestException, KeyError, ValueError) as e:
+            notes.append(f"{name} failed: {e}")
+
+    if best is not None:
+        merged = pd.merge(base, best, on="timestamp", how="left")
+    else:
+        merged = base.copy()
+        for c in WEATHER_COLUMNS:
+            merged[c] = np.nan
+
+    cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=NASA_LATENCY_DAYS)
+    merged["weather_data_pending"] = (merged["timestamp"] >= cutoff) & merged["irradiance_wm2"].isna()
+    n_pending = int(merged["weather_data_pending"].sum())
+    return merged, n_pending, {"source": best_src, "coverage": best_cov, "notes": notes}
 
 
 def merge_with_nasa_power(fusion_df, lat, lon):
-    """
-    Takes a raw FusionSolar dataframe (must already have a parsed
-    timestamp column), automatically fetches matching NASA POWER
-    weather data for the same date range, and merges the two on
-    the shared hourly timestamp. Rows falling within NASA POWER's
-    known latency window are flagged separately so they can be
-    handled without silently guessing weather values.
-    """
-    start_date = fusion_df["timestamp"].min().normalize()
-    end_date   = fusion_df["timestamp"].max().normalize()
-
-    weather_df = fetch_nasa_power_historical(lat, lon, start_date, end_date)
-
-    merged = pd.merge(fusion_df, weather_df, on="timestamp", how="left")
-
-    latency_cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=NASA_LATENCY_DAYS)
-    merged["weather_data_pending"] = (
-        merged["timestamp"] >= latency_cutoff
-    ) & merged["irradiance_wm2"].isna()
-
-    n_pending = merged["weather_data_pending"].sum()
+    merged, n_pending, _ = merge_with_weather(fusion_df, lat, lon)
     return merged, n_pending

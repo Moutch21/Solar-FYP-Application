@@ -27,7 +27,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from locations import MALAYSIA_LOCATIONS
-from weather import merge_with_nasa_power, fetch_weather_forecast, NASA_LATENCY_DAYS
+from weather import merge_with_weather, fetch_weather_forecast, NASA_LATENCY_DAYS
 from data_pipeline import (
     generate_sample_data, label_window, engineer_features,
     build_forecast_features, load_plant_report,
@@ -390,7 +390,7 @@ if uploaded is not None:
         raw, has_real_consumption = load_plant_report(uploaded)
 
         with st.spinner("Getting the weather for your area..."):
-            raw, n_pending = merge_with_nasa_power(raw, HOME_LATITUDE, HOME_LONGITUDE)
+            raw, n_pending, wx_info = merge_with_weather(raw, HOME_LATITUDE, HOME_LONGITUDE)
 
         if n_pending > 0:
             st.sidebar.warning(
@@ -405,6 +405,12 @@ if uploaded is not None:
         usage_note = ("Your real electricity use was found." if has_real_consumption
                       else "No electricity use found, so the monthly figure under Advanced settings is used.")
         st.sidebar.success(f"Loaded {len(raw):,} hours of data for {selected_city}, {selected_state}. {usage_note}")
+        if wx_info["source"] is None:
+            st.sidebar.warning("We could not get weather data right now, so the weather charts are hidden and accuracy uses time of day only. Please try again shortly.")
+        elif wx_info["coverage"] < 0.5:
+            st.sidebar.warning(f"Weather was only found for {wx_info['coverage']*100:.0f}% of daytime hours, so the weather charts may look thin.")
+        else:
+            st.sidebar.success(f"Weather matched for {wx_info['coverage']*100:.0f}% of daytime hours ({wx_info['source']}).")
         using_sample = False
     except ValueError as e:
         st.sidebar.error(f"{e} Showing demo data instead.")
