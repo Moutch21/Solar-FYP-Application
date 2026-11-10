@@ -783,11 +783,12 @@ with tab5:
             show_html('<div class="days">' + "".join(day_cards) + '</div>')
 
             section("Solar power expected each day")
-            fig_fc = px.bar(daily_forecast, x='Date', y='Predicted kWh',
-                            labels={'Date': 'Date', 'Predicted kWh': 'Expected solar power (kWh)'},
-                            hover_data={'Date': True, 'Predicted kWh': ':.2f'})
-            fig_fc.update_traces(marker_color='#FFB020',
-                                 hovertemplate='%{x|%d %b %Y}<br>%{y:.2f} kWh<extra></extra>')
+            fig_fc = px.line(daily_forecast, x='Date', y='Predicted kWh', markers=True,
+                             labels={'Date': 'Date', 'Predicted kWh': 'Expected solar power (kWh)'})
+            fig_fc.update_traces(line=dict(color='#FFB020', width=3),
+                                 marker=dict(size=9, color='#FFB020', line=dict(color='#FFFFFF', width=2)),
+                                 hovertemplate='%{x|%a, %d %b %Y}<br>%{y:.2f} kWh<extra></extra>')
+            fig_fc.update_xaxes(dtick=86400000, tickformat='%a<br>%d %b')
             fig_fc.update_layout(height=380)
             st.plotly_chart(polish(fig_fc))
 
