@@ -795,13 +795,19 @@ with tab5:
             section("This week at a glance")
             daytime_fc = fc_result[fc_result['weather_condition'].isin(['Sunny', 'Cloudy', 'Rainy'])]
             week_total_kwh = daily_forecast['Predicted kWh'].sum()
-            avg_daily_consumption = (df['consumption_kwh'].sum() / df['timestamp'].dt.date.nunique()
-                                     if 'consumption_kwh' in df.columns and df['consumption_kwh'].notna().sum() > 0
-                                     else monthly_kwh / 30)
-            week_saving = min(week_total_kwh, avg_daily_consumption * 7) * TNB_TOTAL_RATE
+            # Value the forecast the same way the Savings tab values past
+            # generation: only the share of solar the home uses itself
+            # saves money, so apply the self consumption ratio measured in
+            # the uploaded report (or estimated from the slider if the
+            # report has no consumption data).
+            past_solar = savings_df['solar_generated_kwh'].sum()
+            self_use_ratio = (savings_df['solar_offset_kwh'].sum() / past_solar
+                              if past_solar > 0 else 0.0)
+            week_saving = week_total_kwh * self_use_ratio * TNB_TOTAL_RATE
             week_cards = [
                 ("☀️", "Solar power expected", f"{week_total_kwh:,.1f} kWh", "over 7 days", AMBER),
-                ("💰", "Estimated savings", f"RM {week_saving:,.2f}", "this week", GREEN),
+                ("💰", "Estimated savings", f"RM {week_saving:,.2f}",
+                 f"this week, if you use {self_use_ratio * 100:.0f}% of it at home as before", GREEN),
             ]
             if len(daytime_fc) > 0:
                 wc_counts = daytime_fc['weather_condition'].value_counts()
